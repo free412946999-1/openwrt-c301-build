@@ -107,73 +107,75 @@ jobs:
           end
           LUA
 
-      - name: 创建 default-config 包（旁路由+无线+SSH）
+      - name: 创建 default-config 包（旁路由+无线+SSH，uci-defaults 方式）
         run: |
-          mkdir -p package/custom/default-config/files/etc/config package/custom/default-config/uci-defaults
+          mkdir -p package/custom/default-config/uci-defaults
 
-          cat > package/custom/default-config/files/etc/config/network << 'EOF'
-          config interface 'loopback'
-            option device 'lo'
-            option proto 'static'
-            option ipaddr '127.0.0.1'
-            option netmask '255.0.0.0'
-          config globals 'globals'
-            option ula_prefix 'fd00:1:1:1::/64'
-          config device
-            option name 'br-lan'
-            option type 'bridge'
-            list ports 'lan1'
-            list ports 'lan2'
-            list ports 'lan3'
-            list ports 'lan4'
-            list ports 'wan'
-          config interface 'lan'
-            option device 'br-lan'
-            option proto 'static'
-            option ipaddr '192.168.10.88'
-            option netmask '255.255.255.0'
-            option gateway '192.168.10.10'
-            option dns '192.168.10.10'
-          EOF
-
-          cat > package/custom/default-config/files/etc/config/dhcp << 'EOF'
-          config dnsmasq
-            option domainneeded '1'
-            option boguspriv '1'
-            option local '/lan/'
-            option domain 'lan'
-            option leasefile '/tmp/dhcp.leases'
-          config dhcp 'lan'
-            option interface 'lan'
-            option dhcpv4 'disable'
-            option ignore '1'
-          EOF
-
-          cat > package/custom/default-config/files/etc/config/dropbear << 'EOF'
-          config dropbear
-            option PasswordAuth 'on'
-            option RootPasswordAuth 'on'
-            option Port '22'
-            # 不限定 Interface -> SSH 监听全部接口（含任意网口）
-          EOF
-
-          cat > package/custom/default-config/uci-defaults/90-c301-wifi << 'EOF'
+          cat > package/custom/default-config/uci-defaults/90-c301-config << 'EOF'
           #!/bin/sh
-          uci set wireless.radio0.disabled=0
-          uci set wireless.@wifi-iface[0].ssid='CMCC-Sweet_Home_c301'
-          uci set wireless.@wifi-iface[0].encryption='psk2'
-          uci set wireless.@wifi-iface[0].key='412946999'
-          uci set wireless.@wifi-iface[0].mode='ap'
+          # 一键旁路由/交换机：全桥 + 管理IP 88 + 关DHCP + SSH全开 + WiFi
+          # 1) 网络：全桥（lan1-4 + wan 全进 br-lan），静态 192.168.10.88/24
+          uci -q delete network.lan
+          uci -q delete network.wan
+          uci set network.lan=interface
+          uci set network.lan.device='br-lan'
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr='192.168.10.88'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set network.lan.gateway='192.168.10.10'
+          uci set network.lan.dns='192.168.10.10'
+          uci -q delete network.brlan
+          uci set network.brlan=device
+          uci set network.brlan.name='br-lan'
+          uci set network.brlan.type='bridge'
+          uci -q delete network.brlan.ports
+          uci add_list network.brlan.ports='lan1'
+          uci add_list network.brlan.ports='lan2'
+          uci add_list network.brlan.ports='lan3'
+          uci add_list network.brlan.ports='lan4'
+          uci add_list network.brlan.ports='wan'
+          uci commit network
+          # 2) 关 DHCP（上级 192.168.10.10 负责分配）
+          uci -q delete dhcp.lan
+          uci set dhcp.lan=dhcp
+          uci set dhcp.lan.interface='lan'
+          uci set dhcp.lan.dhcpv4='disabled'
+          uci set dhcp.lan.ignore='1'
+          uci commit dhcp
+          # 3) SSH 全开放（监听所有接口，允许 root 密码登录）
+          uci -q delete dropbear.@dropbear[0].Interface
+          uci set dropbear.@dropbear[0].PasswordAuth='on'
+          uci set dropbear.@dropbear[0].RootPasswordAuth='on'
+          uci commit dropbear
+          # 4) WiFi：CMCC-Sweet_Home_c301 / 412946999
+          uci -q delete wireless.radio0
+          uci set wireless.radio0=wifi-device
+          uci set wireless.radio0.type='mac80211'
+          uci set wireless.radio0.path='platform/ahb/18100000.wmac'
+          uci set wireless.radio0.channel='6'
+          uci set wireless.radio0.htmode='HT20'
+          uci set wireless.radio0.country='CN'
+          uci -q delete wireless.default_radio0
+          uci set wireless.default_radio0=wifi-iface
+          uci set wireless.default_radio0.device='radio0'
+          uci set wireless.default_radio0.network='lan'
+          uci set wireless.default_radio0.mode='ap'
+          uci set wireless.default_radio0.ssid='CMCC-Sweet_Home_c301'
+          uci set wireless.default_radio0.encryption='psk2'
+          uci set wireless.default_radio0.key='412946999'
           uci commit wireless
-          wifi up
+          /etc/init.d/network restart
+          /etc/init.d/dropbear restart
+          /etc/init.d/wifi restart 2>/dev/null || true
+          exit 0
           EOF
-          chmod +x package/custom/default-config/uci-defaults/90-c301-wifi
+          chmod +x package/custom/default-config/uci-defaults/90-c301-config
 
           cat > package/custom/default-config/Makefile << 'EOF'
           include $(TOPDIR)/rules.mk
           PKG_NAME:=default-config
           PKG_VERSION:=1.0
-          PKG_RELEASE:=1
+          PKG_RELEASE:=2
           include $(INCLUDE_DIR)/package.mk
           define Build/Compile
           endef
@@ -181,7 +183,8 @@ jobs:
             TITLE:=C301 Default Config (Bypass Router)
           endef
           define Package/default-config/install
-            $(CP) ./files/* $(1)/
+            $(INSTALL_DIR) $(1)/etc/uci-defaults
+            $(INSTALL_BIN) files/uci-defaults/90-c301-config $(1)/etc/uci-defaults/
           endef
           $(eval $(call BuildPackage,default-config))
           EOF
