@@ -1,0 +1,261 @@
+name: Build OpenWrt for Qihoo C301
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: Checkout OpenWrt 25.12.5
+        uses: actions/checkout@v4
+        with:
+          repository: openwrt/openwrt
+          ref: v25.12.5
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-distutils python3-setuptools rsync unzip zlib1g-dev \
+            file wget subversion mercurial ccache
+          # 安装 Go（frpc 需要）
+          wget -q https://go.dev/dl/go1.23.0.linux-amd64.tar.gz
+          sudo tar -C /usr/local -xzf go1.23.0.linux-amd64.tar.gz
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      - name: 32MB 分区改造 (DTS)
+        run: |
+          # 改 DTS 为 32MB flash
+          sed -i 's/reg = <0 0x000000 0x01000000>/reg = <0 0x000000 0x02000000>/' target/linux/ath79/dts/ar9344_qihoo_c301.dts
+          sed -i 's/label = "firmware";/label = "firmware";\nread-only;\n       };\n\n&partitions {\n          compatible = "fixed-partitions";\n          #address-cells = <1>;\n          #size-cells = <1>;\n\n          partition@0 {\n                    label = "u-boot";\n                    reg = <0x000000 0x40000>;\n                    read-only;\n          };\n\n          partition@40000 {\n                    label = "u-boot-env";\n                    reg = <0x040000 0x10000>;\n                    read-only;\n          };\n\n          factory: partition@50000 {\n                    label = "factory";\n                    reg = <0x050000 0x10000>;\n                    read-only;\n          };\n\n          partition@60000 {\n                    label = "kernel";\n                    reg = <0x060000 0x1800000>;\n          };\n\n          partition@1860000 {\n                    label = "rootfs";\n                    reg = <0x1860000 0x7a0000>;\n          };\n\n          partition@2000000 {\n                    label = "nic";\n                    reg = <0x2000000 0x200000>;\n                    read-only;\n          };\n  };/' target/linux/ath79/dts/ar9344_qihoo_c301.dts
+          # 改 IMAGE_SIZE
+          sed -i 's/IMAGE_SIZE := 16M/IMAGE_SIZE := 32M/' target/linux/ath79/image/generic.mk
+
+      - name: 克隆 Argon 主题
+        run: |
+          git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon package/luci-theme-argon
+
+      - name: 创建 cups 包
+        run: |
+          mkdir -p package/custom/cups/files
+          cat > package/custom/cups/Makefile << 'EOF'
+          include $(TOPDIR)/rules.mk
+          PKG_NAME:=cups
+          PKG_VERSION:=2.3.0
+          PKG_RELEASE:=2
+          PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-source.tar.gz
+          PKG_SOURCE_URL:=https://github.com/apple/cups/releases/download/v$(PKG_VERSION)
+          PKG_HASH:=644f374573f5433fb8a8af3880db6a98
+          PKG_BUILD_FLAGS:=no-mips16
+          TARGET_LDFLAGS+=-Wl,-rpath-link=$(STAGING_DIR)/usr/lib
+          include $(INCLUDE_DIR)/package.mk
+          define Package/cups
+          	SECTION:=utils
+          	CATEGORY:=Utilities
+          	TITLE:=CUPS Printing System
+          	DEPENDS:=+libpthread +libstdcpp +zlib
+          endef
+          define Build/Configure
+          	$(call Build/Configure/Default, \
+          		--disable-shared --enable-static \
+          		--disable-libusb --disable-acl --disable-dnssd \
+          		--disable-dbus --disable-avahi --disable-ldap \
+          		--disable-pam --disable-slp --disable-gnutls \
+          		--disable-openssl --disable-cdsassl \
+          	)
+          endef
+          define Build/Compile
+          	$(MAKE) -C $(PKG_BUILD_DIR)/cups \
+          		$(TARGET_CONFIGURE_OPTS) \
+          		libcups.a
+          	$(MAKE) -C $(PKG_BUILD_DIR)/scheduler \
+          		$(TARGET_CONFIGURE_OPTS) \
+          		DSTROOT="$(PKG_INSTALL_DIR)" \
+          		cupsd
+          endef
+          define Package/cups/install
+          	$(INSTALL_DIR) $(1)/usr/sbin $(1)/usr/bin $(1)/usr/lib/cups $(1)/etc/cups
+          	$(CP) $(PKG_BUILD_DIR)/scheduler/cupsd $(1)/usr/sbin/
+          	$(CP) $(PKG_BUILD_DIR)/cups/libcups.a $(1)/usr/lib/cups/
+          endef
+          $(eval $(call BuildPackage,cups))
+          EOF
+      - name: 创建 luci-app-cupsd 包
+        run: |
+          mkdir -p package/custom/luci-app-cupsd/luci/controller package/custom/luci-app-cupsd/luci/model/cbi
+          cat > package/custom/luci-app-cupsd/Makefile << 'EOF'
+          include $(TOPDIR)/rules.mk
+          PKG_NAME:=luci-app-cupsd
+          PKG_VERSION:=1.0.0
+          PKG_RELEASE:=1
+          LUCI_TITLE:=CUPS Printing Service
+          LUCI_DEPENDS:=+cups
+          include ../../luci.mk
+          $(call BuildPackage,luci-app-cupsd)
+          EOF
+          cat > package/custom/luci-app-cupsd/luci/controller/cupsd.lua << 'LUA'
+          module("luci.controller.cupsd", package.seeall)
+          function index()
+            entry({"admin", "services", "cupsd"}, firstchild(), _("CUPS"), 60).dependent=false
+          end
+          LUA
+
+      - name: 创建 default-config 包（旁路由+无线+SSH）
+        run: |
+          mkdir -p package/custom/default-config/files/etc/config package/custom/default-config/uci-defaults
+
+          cat > package/custom/default-config/files/etc/config/network << 'EOF'
+          config interface 'loopback'
+            option device 'lo'
+            option proto 'static'
+            option ipaddr '127.0.0.1'
+            option netmask '255.0.0.0'
+          config globals 'globals'
+            option ula_prefix 'fd00:1:1:1::/64'
+          config device
+            option name 'br-lan'
+            option type 'bridge'
+            list ports 'lan1'
+            list ports 'lan2'
+            list ports 'lan3'
+            list ports 'lan4'
+            list ports 'wan'
+          config interface 'lan'
+            option device 'br-lan'
+            option proto 'static'
+            option ipaddr '192.168.10.88'
+            option netmask '255.255.255.0'
+            option gateway '192.168.10.10'
+            option dns '192.168.10.10'
+          EOF
+
+          cat > package/custom/default-config/files/etc/config/dhcp << 'EOF'
+          config dnsmasq
+            option domainneeded '1'
+            option boguspriv '1'
+            option local '/lan/'
+            option domain 'lan'
+            option leasefile '/tmp/dhcp.leases'
+          config dhcp 'lan'
+            option interface 'lan'
+            option dhcpv4 'disable'
+            option ignore '1'
+          EOF
+
+          cat > package/custom/default-config/files/etc/config/dropbear << 'EOF'
+          config dropbear
+            option PasswordAuth 'on'
+            option RootPasswordAuth 'on'
+            option Port '22'
+            # 不限定 Interface -> SSH 监听全部接口（含任意网口）
+          EOF
+
+          cat > package/custom/default-config/uci-defaults/90-c301-wifi << 'EOF'
+          #!/bin/sh
+          uci set wireless.radio0.disabled=0
+          uci set wireless.@wifi-iface[0].ssid='CMCC-Sweet_Home_c301'
+          uci set wireless.@wifi-iface[0].encryption='psk2'
+          uci set wireless.@wifi-iface[0].key='412946999'
+          uci set wireless.@wifi-iface[0].mode='ap'
+          uci commit wireless
+          wifi up
+          EOF
+          chmod +x package/custom/default-config/uci-defaults/90-c301-wifi
+
+          cat > package/custom/default-config/Makefile << 'EOF'
+          include $(TOPDIR)/rules.mk
+          PKG_NAME:=default-config
+          PKG_VERSION:=1.0
+          PKG_RELEASE:=1
+          include $(INCLUDE_DIR)/package.mk
+          define Build/Compile
+          endef
+          define Package/default-config
+            TITLE:=C301 Default Config (Bypass Router)
+          endef
+          define Package/default-config/install
+            $(CP) ./files/* $(1)/
+          endef
+          $(eval $(call BuildPackage,default-config))
+          EOF
+
+      - name: Update feeds
+        run: ./scripts/feeds update -a && ./scripts/feeds install -a
+
+      - name: Golang hack (GOTOOLCHAIN=auto)
+        run: |
+          # 让 Go 自动下载匹配工具链（frpc 需要 Go 1.24+，runner 有 Go 1.23）
+          # 必须在 feeds update 之后执行，否则 feeds 目录不存在
+          sed -i 's/GOTOOLCHAIN=local/GOTOOLCHAIN=auto/' feeds/packages/lang/golang/golang-package.mk
+          grep GOTOOLCHAIN feeds/packages/lang/golang/golang-package.mk | head -1
+
+      - name: Configure .config
+        run: |
+          cat > .config << 'EOF'
+          CONFIG_TARGET_ath79=y
+          CONFIG_TARGET_ath79_generic=y
+          CONFIG_TARGET_ath79_generic_DEVICE_qihoo_c301=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-app-opkg=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-app-wol=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_frpc=y
+          CONFIG_PACKAGE_luci-app-frpc=y
+          CONFIG_PACKAGE_luci-app-cupsd=y
+          CONFIG_PACKAGE_cups=y
+          CONFIG_PACKAGE_p910nd=y
+          CONFIG_PACKAGE_luci-app-p910nd=y
+          CONFIG_PACKAGE_default-config=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_kmod-usb2=y
+          CONFIG_PACKAGE_wpad-basic=y
+          CONFIG_PACKAGE_dropbear=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_openssl-util=y
+          # 排除不需要的
+          # CONFIG_PACKAGE_luci-app-ddns is not set
+          # CONFIG_PACKAGE_dnsfilter is not set
+          # CONFIG_PACKAGE_jd-dailybonus is not set
+          # CONFIG_PACKAGE_luci-app-serverchan is not set
+          CONFIG_TARGET_ROOTFS_PARTSIZE=28
+          EOF
+          make defconfig
+
+      - name: Build firmware
+        run: |
+          echo "::group::Make"
+          make -j$(nproc) V=s > build.log 2>&1
+          rc=$?
+          echo "::endgroup::"
+          if [ $rc -ne 0 ]; then
+            echo "=== BUILD FAILED rc=$rc ==="
+            echo "===== TAIL 120 ====="
+            tail -120 build.log
+            echo "===== ERROR LINES ====="
+            grep -E "Error|error:|Stop\.|No space|Killed|No such|make\[[0-9]+\].*Error" build.log | tail -40
+            exit $rc
+          fi
+          echo "BUILD_OK"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-c301-firmware
+          path: bin/targets/ath79/generic/*qihoo_c301*.bin
+          retention-days: 7
