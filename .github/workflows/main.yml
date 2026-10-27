@@ -31,11 +31,16 @@ jobs:
 
       - name: 32MB 分区改造 (DTS)
         run: |
-          # 改 DTS 为 32MB flash
-          sed -i 's/reg = <0 0x000000 0x01000000>/reg = <0 0x000000 0x02000000>/' target/linux/ath79/dts/ar9344_qihoo_c301.dts
-          sed -i 's/label = "firmware";/label = "firmware";\nread-only;\n       };\n\n&partitions {\n          compatible = "fixed-partitions";\n          #address-cells = <1>;\n          #size-cells = <1>;\n\n          partition@0 {\n                    label = "u-boot";\n                    reg = <0x000000 0x40000>;\n                    read-only;\n          };\n\n          partition@40000 {\n                    label = "u-boot-env";\n                    reg = <0x040000 0x10000>;\n                    read-only;\n          };\n\n          factory: partition@50000 {\n                    label = "factory";\n                    reg = <0x050000 0x10000>;\n                    read-only;\n          };\n\n          partition@60000 {\n                    label = "kernel";\n                    reg = <0x060000 0x1800000>;\n          };\n\n          partition@1860000 {\n                    label = "rootfs";\n                    reg = <0x1860000 0x7a0000>;\n          };\n\n          partition@2000000 {\n                    label = "nic";\n                    reg = <0x2000000 0x200000>;\n                    read-only;\n          };\n  };/' target/linux/ath79/dts/ar9344_qihoo_c301.dts
-          # 改 IMAGE_SIZE
-          sed -i 's/IMAGE_SIZE := 16M/IMAGE_SIZE := 32M/' target/linux/ath79/image/generic.mk
+          # 改 DTS 为 32MB flash（官方 16MB：firmware 0x70000..0x1000000，radiocfg 16M 尾）
+          # 32MB 布局：firmware(seama) 0x70000..0x1ff0000，radiocfg 移至 0x1ff0000..0x2000000
+          sed -i 's/reg = <0x70000 0xf60000>;/reg = <0x70000 0x1f80000>;/' target/linux/ath79/dts/ar9344_qihoo_c301.dts
+          # 删除 warm_start 与 action_image_config 两个尾部小分区（并入 firmware）
+          sed -i '/partition@fd0000 {/,/};/d' target/linux/ath79/dts/ar9344_qihoo_c301.dts
+          sed -i '/partition@fe0000 {/,/};/d' target/linux/ath79/dts/ar9344_qihoo_c301.dts
+          # radiocfg 移到 32MB 尾部（保持 nvmem 校准引用）
+          sed -i 's/reg = <0xff0000 0x10000>;/reg = <0x1ff0000 0x10000>;/' target/linux/ath79/dts/ar9344_qihoo_c301.dts
+          # 改 IMAGE_SIZE（官方 qihoo_c301 为 15744k，改 32MB）
+          sed -i 's/IMAGE_SIZE := 15744k/IMAGE_SIZE := 32768k/' target/linux/ath79/image/generic.mk
 
       - name: 克隆 Argon 主题
         run: |
