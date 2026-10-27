@@ -109,9 +109,9 @@ jobs:
 
       - name: 创建 default-config 包（旁路由+无线+SSH，uci-defaults 方式）
         run: |
-          mkdir -p package/custom/default-config/uci-defaults
+          mkdir -p package/custom/default-config/files/uci-defaults
 
-          cat > package/custom/default-config/uci-defaults/90-c301-config << 'EOF'
+          cat > package/custom/default-config/files/uci-defaults/90-c301-config << 'EOF'
           #!/bin/sh
           # 一键旁路由/交换机：全桥 + 管理IP 88 + 关DHCP + SSH全开 + WiFi
           # 1) 网络：全桥（lan1-4 + wan 全进 br-lan），静态 192.168.10.88/24
@@ -169,7 +169,7 @@ jobs:
           /etc/init.d/wifi restart 2>/dev/null || true
           exit 0
           EOF
-          chmod +x package/custom/default-config/uci-defaults/90-c301-config
+          chmod +x package/custom/default-config/files/uci-defaults/90-c301-config
 
           cat > package/custom/default-config/Makefile << 'EOF'
           include $(TOPDIR)/rules.mk
