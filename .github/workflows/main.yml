@@ -183,8 +183,7 @@ jobs:
             TITLE:=C301 Default Config (Bypass Router)
           endef
           define Package/default-config/install
-            $(INSTALL_DIR) $(1)/etc/uci-defaults
-            $(INSTALL_BIN) files/uci-defaults/90-c301-config $(1)/etc/uci-defaults/
+            $(CP) ./files/* $(1)/
           endef
           $(eval $(call BuildPackage,default-config))
           EOF
